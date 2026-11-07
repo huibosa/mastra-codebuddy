@@ -13,9 +13,13 @@ The library runs the `codebuddy` on `PATH`, so the app and your shell share one 
 one login. The CLI that comes bundled with the SDK is never used.
 
 ```jsonc
-// package.json of the app
-"dependencies": { "mastra-codebuddy": "file:../../mastra-codebuddy" }
+// package.json of the app; pin a tag
+"dependencies": { "mastra-codebuddy": "git+ssh://git@github.com/huibosa/mastra-codebuddy.git#v0.1.0" }
 ```
+
+The repo is private. Install over SSH, which needs a GitHub SSH key on the machine. Bun fetches
+`github:` and `git+https://github.com/…` dependencies as tarballs from the GitHub API, and those
+requests fail with a 404 for private repos.
 
 ## Use
 
