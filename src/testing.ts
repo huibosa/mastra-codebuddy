@@ -26,9 +26,26 @@ export type FakeIo = {
 };
 
 export const FAKE_USAGE = { input_tokens: 1200, output_tokens: 34, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0 };
+export const FAKE_CREDITS = 0.37;
+// What get_available_models answers, in the CLI's raw model shape.
+export const FAKE_MODELS = [
+  {
+    id: "deepseek-v4.1-flash",
+    name: "DeepSeek V4.1 Flash",
+    supportsImages: true,
+    maxInputTokens: 1_000_000,
+    maxOutputTokens: 128_000,
+    credits: "x0.11 credits",
+    reasoning: { supportedEfforts: ["low", "high", "max"], defaultEffort: "high" }
+  },
+  { id: "glm-5.2", name: "GLM 5.2", supportsImages: false, maxInputTokens: 1_000_000, maxOutputTokens: 64_000, credits: "x0.79 credits" }
+];
 
 // FAKE_CB_LOG, when set, gets one JSON line per call: a FakeCall.
 export async function fakeCli(handler: (call: FakeCall, io: FakeIo) => Promise<void>) {
+  // The real CLI (2.181.0) exits at once when given this flag, which the SDK adds for its
+  // requestTimeoutMs option.
+  if (process.argv.includes("--request-timeout-ms")) process.exit(1);
   const lines = stdinLines();
   const pending = new Map<string, (response: any) => void>();
   let hooks: Record<string, Array<{ matcher?: string; hookCallbackIds: string[] }>> = {};
@@ -39,9 +56,13 @@ export async function fakeCli(handler: (call: FakeCall, io: FakeIo) => Promise<v
   (async () => {
     for await (const line of lines) {
       const msg = JSON.parse(line);
+      const reply = (response: object) =>
+        emit({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response } });
       if (msg.type === "control_request" && msg.request.subtype === "initialize") {
         hooks = msg.request.hooks ?? {};
-        emit({ type: "control_response", response: { subtype: "success", request_id: msg.request_id, response: {} } });
+        reply({});
+      } else if (msg.type === "control_request" && msg.request.subtype === "get_available_models") {
+        reply({ availableModels: FAKE_MODELS.map((m) => ({ modelId: m.id, name: m.name })), rawModels: FAKE_MODELS });
       } else if (msg.type === "control_response") {
         pending.get(msg.response.request_id)?.(msg.response.response);
       } else if (msg.type === "user") {
@@ -58,13 +79,45 @@ export async function fakeCli(handler: (call: FakeCall, io: FakeIo) => Promise<v
       emit({ type: "control_request", request_id: id, request: payload });
     });
   const usage = FAKE_USAGE;
+  const argv = process.argv.slice(2);
+  // With --include-partial-messages the real CLI streams each model request as raw events
+  // (message_start, content blocks with deltas, message_stop) before the whole message.
+  const partial = argv.includes("--include-partial-messages");
+  const streamEvent = (event: object) => emit({ type: "stream_event", session_id: "fake", parent_tool_use_id: null, event });
+  const streamBlocks = (id: string, content: Array<Record<string, any>>) => {
+    streamEvent({ type: "message_start", message: { id, role: "assistant", content: [], usage } });
+    content.forEach((block, index) => {
+      if (block.type === "tool_use") {
+        streamEvent({ type: "content_block_start", index, content_block: { ...block, input: {} } });
+      } else {
+        const [key, deltaType] = block.type === "thinking" ? ["thinking", "thinking_delta"] : ["text", "text_delta"];
+        const full = String(block[key!] ?? "");
+        streamEvent({ type: "content_block_start", index, content_block: { type: block.type, [key!]: "" } });
+        // Two deltas, so a consumer has to join them.
+        const half = Math.ceil(full.length / 2);
+        for (const piece of [full.slice(0, half), full.slice(half)]) {
+          if (piece) streamEvent({ type: "content_block_delta", index, delta: { type: deltaType, [key!]: piece } });
+        }
+      }
+      streamEvent({ type: "content_block_stop", index });
+    });
+    streamEvent({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage });
+    streamEvent({ type: "message_stop" });
+  };
   const io: FakeIo = {
     emit,
     init: () => emit({ type: "system", subtype: "init", session_id: "fake", tools: [], mcp_servers: [] }),
-    assistant: (content) =>
-      emit({ type: "assistant", session_id: "fake", message: { id: `m${++seq}`, role: "assistant", content, usage, stop_reason: null } }),
-    result: (ok, text) =>
-      emit({ type: "result", session_id: "fake", subtype: ok ? "success" : "error_during_execution", is_error: !ok, result: text, usage, num_turns: 1 }),
+    assistant(content) {
+      const id = `m${++seq}`;
+      if (partial) streamBlocks(id, content as Array<Record<string, any>>);
+      emit({ type: "assistant", session_id: "fake", message: { id, role: "assistant", content, usage, stop_reason: null } });
+    },
+    result(ok, text) {
+      // The CLI's closing usage snapshot, with the credits the whole run cost.
+      const turnUsage = { version: 1, scope: "turn", kind: "snapshot", total: { usage, credits: FAKE_CREDITS, creditStatus: "known" } };
+      emit({ type: "system", subtype: "usage_update", session_id: "fake", _meta: { "codebuddy.ai/turnUsage": turnUsage } });
+      emit({ type: "result", session_id: "fake", subtype: ok ? "success" : "error_during_execution", is_error: !ok, result: text, usage, num_turns: 1 });
+    },
     async search(query, preamble) {
       const id = `ws${++seq}`;
       io.assistant([...(preamble ? [{ type: "text", text: preamble }] : []), { type: "tool_use", id, name: "WebSearch", input: { query } }]);
@@ -83,7 +136,6 @@ export async function fakeCli(handler: (call: FakeCall, io: FakeIo) => Promise<v
     }
   };
 
-  const argv = process.argv.slice(2);
   const content = await promptP;
   const i = argv.indexOf("--system-prompt-file");
   const call = {

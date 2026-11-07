@@ -7,7 +7,7 @@ const text = process.env.FAKE_CB_TEXT ?? "pong";
 await fakeCli(async (_call, io) => {
   switch (mode) {
     case "ok":
-      io.assistant([{ type: "thinking", thinking: "" }]);
+      io.assistant([{ type: "thinking", thinking: "considering" }]);
       io.assistant([{ type: "text", text }]);
       io.result(true, text);
       break;

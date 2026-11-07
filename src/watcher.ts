@@ -13,6 +13,8 @@ export class StreamWatcher {
   inits = 0;
   text = "";
   usage: CodebuddyUsage | null = null;
+  // Credits the run has cost so far, from the CLI's usage updates; null until it reports any.
+  credits: number | null = null;
   result: { ok: boolean; message: string } | null = null;
   violation: string | null = null;
   // Search mode: the model request (by order) each search was made in, and the searches the
@@ -28,6 +30,10 @@ export class StreamWatcher {
     const ev = m as Record<string, any>;
     if (ev.type === "system" && ev.subtype === "init" && ++this.inits > 1) {
       this.violation = "codebuddy started a second model request";
+    } else if (ev.type === "system" && ev.subtype === "usage_update") {
+      // Each update carries the run's running total.
+      const total = ev._meta?.["codebuddy.ai/turnUsage"]?.total;
+      if (total?.creditStatus === "known" && typeof total.credits === "number") this.credits = total.credits;
     } else if (ev.type === "assistant") {
       const request = String(ev.message?.id ?? ev.uuid ?? this.requests.length);
       if (!this.requests.includes(request)) this.requests.push(request);

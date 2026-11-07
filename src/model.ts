@@ -12,9 +12,10 @@ import type {
   LanguageModelV3CallOptions,
   LanguageModelV3GenerateResult,
   LanguageModelV3StreamPart,
+  LanguageModelV3StreamResult,
   SharedV3Warning
 } from "@ai-sdk/provider";
-import { type Effort, type HookCallback, type Options, query, type Query, type UserMessage } from "@tencent-ai/agent-sdk";
+import { type Effort, type HookCallback, type Message, type Options, query, type Query, type UserMessage } from "@tencent-ai/agent-sdk";
 import { RATE_LIMIT, RateLimitError } from "./errors";
 import { toUserMessage } from "./prompt";
 import { StreamWatcher } from "./watcher";
@@ -66,17 +67,47 @@ export class CodebuddyModel implements LanguageModelV3 {
   ) {}
 
   async doGenerate(options: LanguageModelV3CallOptions): Promise<LanguageModelV3GenerateResult> {
-    const { system, message } = toUserMessage(options);
-    const warnings: SharedV3Warning[] = [];
-    if (options.maxOutputTokens) warnings.push({ type: "unsupported", feature: "maxOutputTokens" });
+    return this.call(prepare(options), options.abortSignal);
+  }
 
+  // Text and reasoning stream as the model writes them. In search mode that includes what the
+  // model writes before each search, which doGenerate drops from its reply. Tool calls are the
+  // CLI's own (WebSearch) and are not streamed.
+  async doStream(options: LanguageModelV3CallOptions): Promise<LanguageModelV3StreamResult> {
+    const prepared = prepare(options);
+    // Cancelling the stream stops the CLI.
+    const cancel = new AbortController();
+    const signal = options.abortSignal ? AbortSignal.any([options.abortSignal, cancel.signal]) : cancel.signal;
+    const stream = new ReadableStream<LanguageModelV3StreamPart>({
+      start: (controller) => {
+        controller.enqueue({ type: "stream-start", warnings: prepared.warnings });
+        const parts = new StreamParts((p) => controller.enqueue(p));
+        this.call(prepared, signal, (m) => parts.push(m)).then(
+          (r) => {
+            parts.closeAll();
+            controller.enqueue({ type: "finish", finishReason: r.finishReason, usage: r.usage, providerMetadata: r.providerMetadata });
+            controller.close();
+          },
+          (err) => controller.error(err)
+        );
+      },
+      cancel: () => cancel.abort()
+    });
+    return { stream };
+  }
+
+  private async call(
+    prepared: Prepared,
+    abortSignal: AbortSignal | undefined,
+    onMessage?: (m: Message) => void
+  ): Promise<LanguageModelV3GenerateResult> {
     // Its own empty working directory, so codebuddy finds no project files or memory.
     const dir = join(tmpdir(), "mastra-codebuddy", crypto.randomUUID());
     await mkdir(dir, { recursive: true });
     const systemFile = join(dir, "system.md");
-    await writeFile(systemFile, system || "You are a helpful assistant.");
+    await writeFile(systemFile, prepared.system || "You are a helpful assistant.");
     try {
-      return await this.run(dir, systemFile, message, options.abortSignal, warnings);
+      return await this.run(dir, systemFile, prepared, abortSignal, onMessage);
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
@@ -85,16 +116,16 @@ export class CodebuddyModel implements LanguageModelV3 {
   private async run(
     cwd: string,
     systemFile: string,
-    message: UserMessage,
+    prepared: Prepared,
     abortSignal: AbortSignal | undefined,
-    warnings: SharedV3Warning[]
+    onMessage: ((m: Message) => void) | undefined
   ): Promise<LanguageModelV3GenerateResult> {
     if (abortSignal?.aborted) throw new Error("aborted");
     const search = this.settings.search;
     const watcher = new StreamWatcher(!!search);
     let stderr = "";
     const opts: Options = {
-      pathToCodebuddyCode: this.config.cliPath ?? globalCli(),
+      pathToCodebuddyCode: resolveCli(this.config),
       cwd,
       env: { ...CODEBUDDY_ENV, ...this.config.env },
       model: this.modelId,
@@ -104,11 +135,12 @@ export class CodebuddyModel implements LanguageModelV3 {
       persistSession: false,
       strictMcpConfig: true,
       settingSources: [],
+      includePartialMessages: !!onMessage,
       extraArgs: { "system-prompt-file": systemFile, settings: '{"autoCompactEnabled":false}' },
       hooks: search ? { PreToolUse: [{ matcher: "WebSearch", hooks: [searchCap(search, watcher)] }] } : undefined,
       stderr: (d) => (stderr = (stderr + d).slice(-2000))
     };
-    const q = query({ prompt: once(message), options: opts });
+    const q = query({ prompt: once(prepared.message), options: opts });
 
     let stopped: string | null = null;
     const stop = (why: string) => {
@@ -128,6 +160,7 @@ export class CodebuddyModel implements LanguageModelV3 {
           stopped = watcher.violation;
           break;
         }
+        onMessage?.(m);
       }
     } catch (err) {
       thrown = err;
@@ -156,25 +189,62 @@ export class CodebuddyModel implements LanguageModelV3 {
         },
         outputTokens: { total: u.output, text: undefined, reasoning: undefined }
       },
-      warnings
+      // Credits are what CodeBuddy bills; null when the CLI did not report them.
+      ...(watcher.credits === null ? {} : { providerMetadata: { codebuddy: { credits: watcher.credits } } }),
+      warnings: prepared.warnings
     };
   }
+}
 
-  // No token streaming yet: the whole reply is emitted once the call has finished.
-  async doStream(options: LanguageModelV3CallOptions) {
-    const r = await this.doGenerate(options);
-    const text = r.content.map((c) => (c.type === "text" ? c.text : "")).join("");
-    const stream = new ReadableStream<LanguageModelV3StreamPart>({
-      start(controller) {
-        controller.enqueue({ type: "stream-start", warnings: r.warnings });
-        controller.enqueue({ type: "text-start", id: "0" });
-        controller.enqueue({ type: "text-delta", id: "0", delta: text });
-        controller.enqueue({ type: "text-end", id: "0" });
-        controller.enqueue({ type: "finish", finishReason: r.finishReason, usage: r.usage });
-        controller.close();
-      }
-    });
-    return { stream };
+type Prepared = ReturnType<typeof toUserMessage> & { warnings: SharedV3Warning[] };
+
+// Checks and converts the request before any process starts, so a bad one fails at once.
+function prepare(options: LanguageModelV3CallOptions): Prepared {
+  const warnings: SharedV3Warning[] = [];
+  if (options.maxOutputTokens) warnings.push({ type: "unsupported", feature: "maxOutputTokens" });
+  return { ...toUserMessage(options), warnings };
+}
+
+// Turns the CLI's raw stream events (with --include-partial-messages) into AI SDK stream
+// parts. Each content block of each model request gets its own id.
+class StreamParts {
+  private request = "";
+  private requests = 0;
+  private open = new Map<number, { id: string; kind: "text" | "reasoning" }>();
+
+  constructor(private enqueue: (part: LanguageModelV3StreamPart) => void) {}
+
+  push(m: Message) {
+    if (m.type !== "stream_event") return;
+    const ev = m.event as Record<string, any>;
+    if (ev.type === "message_start") {
+      this.request = String(ev.message?.id ?? `r${this.requests}`);
+      this.requests++;
+    } else if (ev.type === "content_block_start") {
+      const type = ev.content_block?.type;
+      const kind = type === "text" ? "text" : type === "thinking" ? "reasoning" : null;
+      if (!kind) return;
+      const id = `${this.request}:${ev.index}`;
+      this.open.set(ev.index, { id, kind });
+      this.enqueue({ type: `${kind}-start`, id });
+    } else if (ev.type === "content_block_delta") {
+      const block = this.open.get(ev.index);
+      const delta = ev.delta?.type === "text_delta" ? ev.delta.text : ev.delta?.type === "thinking_delta" ? ev.delta.thinking : "";
+      if (block && delta) this.enqueue({ type: `${block.kind}-delta`, id: block.id, delta });
+    } else if (ev.type === "content_block_stop") {
+      this.end(ev.index);
+    }
+  }
+
+  closeAll() {
+    for (const index of [...this.open.keys()]) this.end(index);
+  }
+
+  private end(index: number) {
+    const block = this.open.get(index);
+    if (!block) return;
+    this.open.delete(index);
+    this.enqueue({ type: `${block.kind}-end`, id: block.id });
   }
 }
 
@@ -212,6 +282,10 @@ function forceClose(q: Query) {
   const transport = (q as unknown as { transport?: { close?: () => void } }).transport;
   if (typeof transport?.close !== "function") throw new Error("agent-sdk changed: Query.transport.close() is gone");
   transport.close();
+}
+
+export function resolveCli(config: CodebuddySettings) {
+  return config.cliPath ?? globalCli();
 }
 
 let cachedCli: string | null = null;

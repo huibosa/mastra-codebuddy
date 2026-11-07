@@ -47,6 +47,18 @@ describe("request shape", () => {
 });
 
 describe("stream watcher", () => {
+  test("keeps the latest credit total the CLI reports", () => {
+    const update = (credits: number, creditStatus = "known") =>
+      ev({ type: "system", subtype: "usage_update", _meta: { "codebuddy.ai/turnUsage": { total: { credits, creditStatus } } } });
+    const w = new StreamWatcher(false);
+    expect(w.credits).toBeNull();
+    w.push(update(0.04));
+    w.push(update(0.16));
+    expect(w.credits).toBe(0.16);
+    w.push(update(0, "unknown"));
+    expect(w.credits).toBe(0.16);
+  });
+
   test("flags a second model request", () => {
     const w = new StreamWatcher(false);
     w.push(init);

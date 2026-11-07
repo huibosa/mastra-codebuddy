@@ -3,7 +3,7 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { createCodebuddy, RateLimitError } from "../src";
-import type { FakeCall } from "../src/testing";
+import { FAKE_CREDITS, type FakeCall } from "../src/testing";
 
 const FAKE = join(import.meta.dir, "fixtures/fake-codebuddy.ts");
 const LOG = `/tmp/mastra-codebuddy-fake-${process.pid}.jsonl`;
@@ -93,13 +93,89 @@ describe("single completion", () => {
     expect(performance.now() - t0).toBeLessThan(1_500);
   });
 
-  test("doStream yields the reply", async () => {
-    mode("ok", "streamed");
-    const { stream } = await model.doStream({ prompt: userPrompt("x") });
-    const parts: any[] = [];
-    for await (const p of stream) parts.push(p);
-    expect(parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")).toBe("streamed");
-    expect(parts.at(-1).type).toBe("finish");
+  test("credits come back in provider metadata", async () => {
+    mode("ok", "pong");
+    const r = await model.doGenerate({ prompt: userPrompt("x") });
+    expect(r.providerMetadata).toEqual({ codebuddy: { credits: FAKE_CREDITS } });
+    expect(calls()[0]!.argv).not.toContain("--include-partial-messages");
+  });
+});
+
+const read = async (stream: ReadableStream<any>) => {
+  const parts: any[] = [];
+  for await (const p of stream) parts.push(p);
+  return parts;
+};
+
+describe("streaming", () => {
+  const model = codebuddy("deepseek-v4.1-flash", { effort: "low" });
+
+  test("text and reasoning arrive as deltas, then finish with usage and credits", async () => {
+    mode("ok", "streamed reply");
+    const parts = await read((await model.doStream({ prompt: userPrompt("x") })).stream);
+    expect(calls()[0]!.argv).toContain("--include-partial-messages");
+    const types = parts.map((p) => p.type);
+    expect(types[0]).toBe("stream-start");
+    expect(types).toEqual(expect.arrayContaining(["reasoning-start", "reasoning-delta", "reasoning-end", "text-start", "text-end"]));
+    const deltas = parts.filter((p) => p.type === "text-delta");
+    expect(deltas.length).toBeGreaterThan(1);
+    expect(deltas.map((p) => p.delta).join("")).toBe("streamed reply");
+    expect(parts.filter((p) => p.type === "reasoning-delta").map((p) => p.delta).join("")).toBe("considering");
+    const finish = parts.at(-1);
+    expect(finish).toMatchObject({ type: "finish", finishReason: { unified: "stop" }, providerMetadata: { codebuddy: { credits: FAKE_CREDITS } } });
+    expect(finish.usage.inputTokens.total).toBe(1200);
+  });
+
+  test("each block is opened before its deltas and closed once", async () => {
+    mode("ok", "pong");
+    const parts = await read((await model.doStream({ prompt: userPrompt("x") })).stream);
+    const open = new Set<string>();
+    for (const p of parts) {
+      if (p.type.endsWith("-start") && p.id) open.add(p.id);
+      if (p.type.endsWith("-delta")) expect(open.has(p.id)).toBe(true);
+      if (p.type.endsWith("-end")) expect(open.delete(p.id)).toBe(true);
+    }
+    expect(open.size).toBe(0);
+  });
+
+  test("failures error the stream with the same errors as doGenerate", async () => {
+    mode("ratelimit");
+    await expect(read((await model.doStream({ prompt: userPrompt("x") })).stream)).rejects.toBeInstanceOf(RateLimitError);
+    mode("tool");
+    await expect(read((await model.doStream({ prompt: userPrompt("x") })).stream)).rejects.toThrow("Bash");
+  });
+
+  test("a bad prompt is refused before anything starts", async () => {
+    await expect(model.doStream({ prompt: [] })).rejects.toThrow("empty prompt");
+  });
+
+  test("search mode streams the searches' preambles too, and the answer", async () => {
+    mode("search", "the answer");
+    process.env.FAKE_CB_SEARCHES = "2";
+    const searching = codebuddy("deepseek-v4.1-flash", { effort: "low", search: {} });
+    const parts = await read((await searching.doStream({ prompt: userPrompt("x") })).stream);
+    const text = parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("");
+    expect(text).toBe("Let me check the terms. Let me check the terms. the answer");
+    expect(parts.some((p) => p.type === "tool-call")).toBe(false);
+  });
+});
+
+describe("model discovery", () => {
+  test("lists the account's models with efforts, vision, limits and credit rate", async () => {
+    const models = await codebuddy.listModels();
+    expect(models).toEqual([
+      {
+        id: "deepseek-v4.1-flash",
+        name: "DeepSeek V4.1 Flash",
+        efforts: ["low", "high", "max"],
+        defaultEffort: "high",
+        vision: true,
+        maxInput: 1_000_000,
+        maxOutput: 128_000,
+        credits: "x0.11 credits"
+      },
+      { id: "glm-5.2", name: "GLM 5.2", efforts: [], vision: false, maxInput: 1_000_000, maxOutput: 64_000, credits: "x0.79 credits" }
+    ]);
   });
 });
 
